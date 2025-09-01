@@ -73,7 +73,7 @@ graph TB
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/yourusername/unreal-blueprint-mcp.git
+git clone https://github.com/BestDev/unreal_blueprint_mcp.git
 cd unreal-blueprint-mcp
 
 # 2. Install Python dependencies

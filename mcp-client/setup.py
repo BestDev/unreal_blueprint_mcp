@@ -18,7 +18,7 @@ setup(
     description="MCP Server for Unreal Engine Blueprint integration",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/claude-code/unreal-blueprint-mcp",
+    url="https://github.com/BestDev/unreal_blueprint_mcp",
     packages=find_packages(),
     classifiers=[
         "Development Status :: 4 - Beta",

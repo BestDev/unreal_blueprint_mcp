@@ -44,7 +44,7 @@ UnrealBlueprintMCP is a powerful Unreal Engine 5.6+ editor plugin that provides 
 #### 1. **Install the Plugin**
 ```bash
 # Clone or download this repository
-git clone https://github.com/yourusername/unreal-blueprint-mcp.git
+git clone https://github.com/BestDev/unreal_blueprint_mcp.git
 
 # Copy to your project's Plugins directory
 cp -r unreal-blueprint-mcp [YourProject]/Plugins/UnrealBlueprintMCP
