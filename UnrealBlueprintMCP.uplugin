@@ -1,0 +1,24 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "Unreal Blueprint MCP",
+	"Description": "A simple JSON-RPC server plugin for Unreal Engine Blueprint integration with MCP (Model Context Protocol)",
+	"Category": "Editor",
+	"CreatedBy": "UnrealBlueprintMCP Team",
+	"CreatedByURL": "",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"CanContainContent": false,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "UnrealBlueprintMCP",
+			"Type": "Editor",
+			"LoadingPhase": "PostEngineInit"
+		}
+	]
+}

@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "unreal-blueprint-mcp": {
+      "command": "python",
+      "args": [
+        "/home/bestdev/mcp/unreal-blueprint-mcp/mcp_client.py"
+      ],
+      "env": {
+        "UNREAL_SERVER_URL": "http://localhost:8080"
+      }
+    }
+  }
+}
