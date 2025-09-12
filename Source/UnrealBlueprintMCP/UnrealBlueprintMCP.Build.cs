@@ -32,7 +32,12 @@ public class UnrealBlueprintMCP : ModuleRules
 				"SlateCore",
 				"HTTP",
 				"Json",
-				"JsonObjectConverter"
+				// Essential Blueprint Graph modules for K2Node classes (UE 5.6 compatible)
+				"BlueprintGraph",
+				"KismetCompiler",
+				// Core editor modules for Blueprint editing
+				"AssetTools",
+				"AssetRegistry"
 			}
 		);
 			
@@ -42,16 +47,15 @@ public class UnrealBlueprintMCP : ModuleRules
 				"Projects",
 				"InputCore",
 				"LevelEditor",
-				"ToolMenus",
-				"CoreUObject",
-				"Engine",
-				"Slate",
-				"SlateCore",
-				"EditorStyle",
-				"EditorWidgets",
-				"UnrealEd",
 				"Networking",
-				"Sockets"
+				"Sockets",
+				// Blueprint editor support modules
+				"ContentBrowser",
+				"PropertyEditor",
+				// Additional UE 5.6 compatible modules for K2Node functionality
+				"Kismet",
+				"GraphEditor",
+				"KismetWidgets"
 			}
 		);
 		

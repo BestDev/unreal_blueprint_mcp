@@ -3,7 +3,9 @@
 #include "Engine/World.h"
 #include "Engine/Blueprint.h"
 #include "HAL/PlatformFilemanager.h"
+#include "HAL/PlatformProcess.h"
 #include "Misc/FileHelper.h"
+#include "Misc/DateTime.h"
 #include "Async/Async.h"
 #include "Common/TcpSocketBuilder.h"
 #include "AssetRegistry/AssetRegistryModule.h"
@@ -13,12 +15,13 @@
 #include "Factories/BlueprintFactory.h"
 #include "Engine/BlueprintGeneratedClass.h"
 #include "Kismet2/BlueprintEditorUtils.h"
-#include "BlueprintGraph/Classes/K2Node_Event.h"
-#include "BlueprintGraph/Classes/K2Node_CallFunction.h"
-#include "BlueprintGraph/Classes/K2Node_VariableGet.h"
-#include "BlueprintGraph/Classes/K2Node_VariableSet.h"
-#include "BlueprintGraph/Classes/K2Node_CustomEvent.h"
-#include "BlueprintGraph/Classes/K2Node_FunctionEntry.h"
+// Blueprint Graph node includes - Updated for UE 5.6
+#include "K2Node_Event.h"
+#include "K2Node_CallFunction.h"
+#include "K2Node_VariableGet.h"
+#include "K2Node_VariableSet.h"
+#include "K2Node_CustomEvent.h"
+#include "K2Node_FunctionEntry.h"
 #include "Engine/UserDefinedStruct.h"
 #include "Engine/SimpleConstructionScript.h"
 #include "KismetCompiler.h"
@@ -196,25 +199,41 @@ void FMCPJsonRpcServer::HandleClientConnection(FSocket* ClientSocket)
 	uint8 Buffer[1024];
 	int32 BytesRead = 0;
 
-	// Read with timeout
-	ClientSocket->SetReceiveTimeout(FTimespan::FromSeconds(5));
+	// Configure socket for non-blocking mode with timeout handling
+	ClientSocket->SetNonBlocking(true);
+	
+	// Timeout handling for UE 5.6 compatibility
+	double StartTime = FPlatformTime::Seconds();
+	const double TimeoutSeconds = 5.0;
+	bool bRequestComplete = false;
 
-	while (ClientSocket->Recv(Buffer, sizeof(Buffer) - 1, BytesRead))
+	while (!bRequestComplete && (FPlatformTime::Seconds() - StartTime) < TimeoutSeconds)
 	{
-		if (BytesRead > 0)
+		ESocketConnectionState ConnectionState = ClientSocket->GetConnectionState();
+		if (ConnectionState != SCS_Connected)
 		{
-			ReceivedData.Append(Buffer, BytesRead);
-			
-			// Check if we have a complete HTTP request (look for double CRLF)
-			FString RequestStr = FString::ConstructFromPtrSize((char*)ReceivedData.GetData(), ReceivedData.Num());
-			if (RequestStr.Contains(TEXT("\r\n\r\n")))
+			break;
+		}
+
+		if (ClientSocket->Recv(Buffer, sizeof(Buffer) - 1, BytesRead))
+		{
+			if (BytesRead > 0)
 			{
-				break;
+				ReceivedData.Append(Buffer, BytesRead);
+				
+				// Check if we have a complete HTTP request (look for double CRLF)
+				FString RequestStr = FString::ConstructFromPtrSize((char*)ReceivedData.GetData(), ReceivedData.Num());
+				if (RequestStr.Contains(TEXT("\r\n\r\n")))
+				{
+					bRequestComplete = true;
+					break;
+				}
 			}
 		}
 		else
 		{
-			break;
+			// No data available, sleep briefly to avoid busy waiting
+			FPlatformProcess::Sleep(0.001f);
 		}
 	}
 
@@ -506,8 +525,8 @@ TSharedPtr<FJsonObject> FMCPJsonRpcServer::HandleResourcesList(TSharedPtr<FJsonO
 	{
 		TSharedPtr<FJsonObject> AssetJson = MakeShareable(new FJsonObject);
 		AssetJson->SetStringField(TEXT("name"), AssetData.AssetName.ToString());
-		AssetJson->SetStringField(TEXT("path"), AssetData.ObjectPath.ToString());
-		AssetJson->SetStringField(TEXT("class"), AssetData.AssetClass.ToString());
+		AssetJson->SetStringField(TEXT("path"), AssetData.GetObjectPathString());
+		AssetJson->SetStringField(TEXT("class"), AssetData.AssetClassPath.ToString());
 		AssetJson->SetStringField(TEXT("package"), AssetData.PackageName.ToString());
 
 		Assets.Add(MakeShareable(new FJsonValueObject(AssetJson)));
@@ -546,12 +565,12 @@ TSharedPtr<FJsonObject> FMCPJsonRpcServer::HandleResourcesGet(TSharedPtr<FJsonOb
 
 	// Basic asset info
 	Result->SetStringField(TEXT("name"), AssetData.AssetName.ToString());
-	Result->SetStringField(TEXT("path"), AssetData.ObjectPath.ToString());
-	Result->SetStringField(TEXT("class"), AssetData.AssetClass.ToString());
+	Result->SetStringField(TEXT("path"), AssetData.GetObjectPathString());
+	Result->SetStringField(TEXT("class"), AssetData.AssetClassPath.ToString());
 	Result->SetStringField(TEXT("package"), AssetData.PackageName.ToString());
 
 	// Add Blueprint-specific details if it's a Blueprint
-	if (AssetData.AssetClass == UBlueprint::StaticClass()->GetFName())
+	if (AssetData.AssetClassPath == UBlueprint::StaticClass()->GetClassPathName())
 	{
 		UBlueprint* Blueprint = Cast<UBlueprint>(AssetData.GetAsset());
 		if (Blueprint)
@@ -631,7 +650,7 @@ TSharedPtr<FJsonObject> FMCPJsonRpcServer::HandleResourcesCreate(TSharedPtr<FJso
 		if (Params->HasField(TEXT("parent_class")))
 		{
 			FString ParentClassName = Params->GetStringField(TEXT("parent_class"));
-			UClass* ParentClass = FindObject<UClass>(ANY_PACKAGE, *ParentClassName);
+			UClass* ParentClass = FindObject<UClass>(nullptr, *ParentClassName);
 			if (ParentClass)
 			{
 				Factory->ParentClass = ParentClass;
@@ -682,7 +701,7 @@ TSharedPtr<FJsonObject> FMCPJsonRpcServer::HandleToolsCreateBlueprint(TSharedPtr
 	}
 
 	// Find parent class
-	UClass* ParentClassPtr = FindObject<UClass>(ANY_PACKAGE, *ParentClass);
+	UClass* ParentClassPtr = FindObject<UClass>(nullptr, *ParentClass);
 	if (!ParentClassPtr)
 	{
 		ParentClassPtr = AActor::StaticClass(); // Default to Actor if not found
@@ -967,8 +986,9 @@ TSharedPtr<FJsonObject> FMCPJsonRpcServer::HandleToolsEditGraph(TSharedPtr<FJson
 						// Create Begin Play event
 						FGraphNodeCreator<UK2Node_Event> NodeCreator(*Graph);
 						UK2Node_Event* NewNode = NodeCreator.CreateNode();
+						// Use the actual function name for BeginPlay event in UE 5.6
 						NewNode->EventReference.SetExternalMember(
-							GET_FUNCTION_NAME_CHECKED(AActor, BeginPlay),
+							FName("ReceiveBeginPlay"),
 							AActor::StaticClass()
 						);
 						NewNode->bOverrideFunction = true;
