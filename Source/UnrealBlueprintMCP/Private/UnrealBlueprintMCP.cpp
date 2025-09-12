@@ -64,7 +64,8 @@ void FUnrealBlueprintMCPModule::CleanupPlugin()
 void FUnrealBlueprintMCPModule::RegisterMenuExtensions()
 {
 	// Register menu extensions here if needed
-	UToolMenus::RegisterStartupCallback(FSimpleMulticastDelegate::FDelegate::CreateRaw(this, &FUnrealBlueprintMCPModule::RegisterMenuExtensions));
+	// Note: Removed recursive callback registration that was causing stack overflow
+	// TODO: Add actual menu extension implementation when needed
 }
 
 void FUnrealBlueprintMCPModule::UnregisterMenuExtensions()

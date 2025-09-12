@@ -93,4 +93,11 @@ private:
 
 	/** Log server messages */
 	void LogMessage(const FString& Message);
+
+	/** Thread-safe wrapper for editor API calls */
+	template<typename ReturnType>
+	ReturnType ExecuteOnGameThread(TFunction<ReturnType()> Task);
+	
+	/** Thread-safe asynchronous execution for editor API calls */
+	void ExecuteOnGameThreadAsync(TFunction<void()> Task);
 };

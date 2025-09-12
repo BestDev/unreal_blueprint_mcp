@@ -4,6 +4,7 @@
 #include "Engine/Blueprint.h"
 #include "HAL/PlatformFilemanager.h"
 #include "HAL/PlatformProcess.h"
+#include "HAL/Event.h" // For FEvent
 #include "Misc/FileHelper.h"
 #include "Misc/DateTime.h"
 #include "Async/Async.h"
@@ -71,9 +72,18 @@ bool FMCPJsonRpcServer::StartServer(int32 Port)
 	// Allow socket reuse
 	ServerSocket->SetReuseAddr(true);
 
-	// Bind to port
+	// Bind to port - SECURITY FIX: Only bind to localhost for security
 	TSharedRef<FInternetAddr> LocalAddr = SocketSubsystem->CreateInternetAddr();
-	LocalAddr->SetAnyAddress();
+	bool bIsValid = false;
+	LocalAddr->SetIp(TEXT("127.0.0.1"), bIsValid); // localhost only - prevents external network access
+	if (!bIsValid)
+	{
+		LogMessage(TEXT("Failed to set localhost IP address"));
+		ServerSocket->Close();
+		SocketSubsystem->DestroySocket(ServerSocket);
+		ServerSocket = nullptr;
+		return false;
+	}
 	LocalAddr->SetPort(ServerPort);
 
 	if (!ServerSocket->Bind(*LocalAddr))
@@ -461,9 +471,10 @@ FString FMCPJsonRpcServer::CreateHttpResponse(const FString& Content, const FStr
 	FString Response = TEXT("HTTP/1.1 200 OK\r\n");
 	Response += FString::Printf(TEXT("Content-Type: %s\r\n"), *ContentType);
 	Response += FString::Printf(TEXT("Content-Length: %d\r\n"), Content.Len());
-	Response += TEXT("Access-Control-Allow-Origin: *\r\n");
-	Response += TEXT("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n");
-	Response += TEXT("Access-Control-Allow-Headers: Content-Type\r\n");
+	// SECURITY FIX: Removed dangerous CORS headers that allowed any origin access
+	// Only localhost connections are now permitted due to 127.0.0.1 binding
+	Response += TEXT("X-Content-Type-Options: nosniff\r\n"); // Security header to prevent MIME type sniffing
+	Response += TEXT("X-Frame-Options: DENY\r\n"); // Prevent iframe embedding
 	Response += TEXT("\r\n");
 	Response += Content;
 	return Response;
@@ -495,100 +506,193 @@ void FMCPJsonRpcServer::LogMessage(const FString& Message)
 	UE_LOG(LogTemp, Warning, TEXT("MCPJsonRpcServer: %s"), *Message);
 }
 
+template<typename ReturnType>
+ReturnType FMCPJsonRpcServer::ExecuteOnGameThread(TFunction<ReturnType()> Task)
+{
+	// THREAD SAFETY FIX: All Editor API calls must be executed on Game Thread
+	if (IsInGameThread())
+	{
+		// Already on Game Thread, execute directly with error handling
+		try
+		{
+			return Task();
+		}
+		catch (...)
+		{
+			LogMessage(TEXT("Exception caught during Game Thread execution"));
+			return ReturnType{}; // Return default-constructed value
+		}
+	}
+	else
+	{
+		// Marshal to Game Thread and wait for completion
+		ReturnType Result{};
+		bool bTaskCompleted = false;
+		FEvent* CompletionEvent = FPlatformProcess::GetSynchEventFromPool();
+		
+		AsyncTask(ENamedThreads::GameThread, [&Task, &Result, &bTaskCompleted, CompletionEvent, this]()
+		{
+			try
+			{
+				Result = Task();
+				bTaskCompleted = true;
+			}
+			catch (...)
+			{
+				LogMessage(TEXT("Exception caught during marshaled Game Thread execution"));
+				bTaskCompleted = false;
+			}
+			CompletionEvent->Trigger();
+		});
+		
+		// Wait for completion (with timeout to prevent deadlocks)
+		bool bTimedOut = !CompletionEvent->Wait(5000); // 5 second timeout
+		FPlatformProcess::ReturnSynchEventToPool(CompletionEvent);
+		
+		if (bTimedOut)
+		{
+			LogMessage(TEXT("Game Thread execution timed out"));
+		}
+		else if (!bTaskCompleted)
+		{
+			LogMessage(TEXT("Game Thread execution failed"));
+		}
+		
+		return Result;
+	}
+}
+
+void FMCPJsonRpcServer::ExecuteOnGameThreadAsync(TFunction<void()> Task)
+{
+	// THREAD SAFETY FIX: Async execution on Game Thread with error handling
+	if (IsInGameThread())
+	{
+		try
+		{
+			Task();
+		}
+		catch (...)
+		{
+			LogMessage(TEXT("Exception caught during async Game Thread execution"));
+		}
+	}
+	else
+	{
+		AsyncTask(ENamedThreads::GameThread, [Task, this]()
+		{
+			try
+			{
+				Task();
+			}
+			catch (...)
+			{
+				LogMessage(TEXT("Exception caught during async marshaled Game Thread execution"));
+			}
+		});
+	}
+}
+
 TSharedPtr<FJsonObject> FMCPJsonRpcServer::HandleResourcesList(TSharedPtr<FJsonObject> Params)
 {
-	TSharedPtr<FJsonObject> Result = MakeShareable(new FJsonObject);
-	TArray<TSharedPtr<FJsonValue>> Assets;
-
-	// Get path parameter (default to /Game if not provided)
-	FString SearchPath = TEXT("/Game");
-	if (Params.IsValid() && Params->HasField(TEXT("path")))
+	// THREAD SAFETY FIX: Execute AssetRegistry access on Game Thread
+	return ExecuteOnGameThread<TSharedPtr<FJsonObject>>([this, Params]() -> TSharedPtr<FJsonObject>
 	{
-		SearchPath = Params->GetStringField(TEXT("path"));
-	}
+		TSharedPtr<FJsonObject> Result = MakeShareable(new FJsonObject);
+		TArray<TSharedPtr<FJsonValue>> Assets;
 
-	// Get Asset Registry
-	FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry");
-	IAssetRegistry& AssetRegistry = AssetRegistryModule.Get();
+		// Get path parameter (default to /Game if not provided)
+		FString SearchPath = TEXT("/Game");
+		if (Params.IsValid() && Params->HasField(TEXT("path")))
+		{
+			SearchPath = Params->GetStringField(TEXT("path"));
+		}
 
-	// Create filter for the search path
-	FARFilter Filter;
-	Filter.PackagePaths.Add(FName(*SearchPath));
-	Filter.bRecursivePaths = false; // Only immediate children
+		// Get Asset Registry - Safe to call from Game Thread
+		FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry");
+		IAssetRegistry& AssetRegistry = AssetRegistryModule.Get();
 
-	// Get assets
-	TArray<FAssetData> AssetDataArray;
-	AssetRegistry.GetAssets(Filter, AssetDataArray);
+		// Create filter for the search path
+		FARFilter Filter;
+		Filter.PackagePaths.Add(FName(*SearchPath));
+		Filter.bRecursivePaths = false; // Only immediate children
 
-	// Convert to JSON
-	for (const FAssetData& AssetData : AssetDataArray)
-	{
-		TSharedPtr<FJsonObject> AssetJson = MakeShareable(new FJsonObject);
-		AssetJson->SetStringField(TEXT("name"), AssetData.AssetName.ToString());
-		AssetJson->SetStringField(TEXT("path"), AssetData.GetObjectPathString());
-		AssetJson->SetStringField(TEXT("class"), AssetData.AssetClassPath.ToString());
-		AssetJson->SetStringField(TEXT("package"), AssetData.PackageName.ToString());
+		// Get assets
+		TArray<FAssetData> AssetDataArray;
+		AssetRegistry.GetAssets(Filter, AssetDataArray);
 
-		Assets.Add(MakeShareable(new FJsonValueObject(AssetJson)));
-	}
+		// Convert to JSON
+		for (const FAssetData& AssetData : AssetDataArray)
+		{
+			TSharedPtr<FJsonObject> AssetJson = MakeShareable(new FJsonObject);
+			AssetJson->SetStringField(TEXT("name"), AssetData.AssetName.ToString());
+			AssetJson->SetStringField(TEXT("path"), AssetData.GetObjectPathString());
+			AssetJson->SetStringField(TEXT("class"), AssetData.AssetClassPath.ToString());
+			AssetJson->SetStringField(TEXT("package"), AssetData.PackageName.ToString());
 
-	Result->SetArrayField(TEXT("assets"), Assets);
-	Result->SetNumberField(TEXT("count"), Assets.Num());
-	Result->SetStringField(TEXT("path"), SearchPath);
+			Assets.Add(MakeShareable(new FJsonValueObject(AssetJson)));
+		}
 
-	return Result;
+		Result->SetArrayField(TEXT("assets"), Assets);
+		Result->SetNumberField(TEXT("count"), Assets.Num());
+		Result->SetStringField(TEXT("path"), SearchPath);
+
+		return Result;
+	});
 }
 
 TSharedPtr<FJsonObject> FMCPJsonRpcServer::HandleResourcesGet(TSharedPtr<FJsonObject> Params)
 {
-	TSharedPtr<FJsonObject> Result = MakeShareable(new FJsonObject);
-
-	if (!Params.IsValid() || !Params->HasField(TEXT("asset_path")))
+	// THREAD SAFETY FIX: Execute asset loading on Game Thread
+	return ExecuteOnGameThread<TSharedPtr<FJsonObject>>([this, Params]() -> TSharedPtr<FJsonObject>
 	{
-		Result->SetStringField(TEXT("error"), TEXT("Missing asset_path parameter"));
-		return Result;
-	}
+		TSharedPtr<FJsonObject> Result = MakeShareable(new FJsonObject);
 
-	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
-
-	// Get Asset Registry
-	FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry");
-	IAssetRegistry& AssetRegistry = AssetRegistryModule.Get();
-
-	// Find asset
-	FAssetData AssetData = AssetRegistry.GetAssetByObjectPath(FSoftObjectPath(AssetPath));
-	if (!AssetData.IsValid())
-	{
-		Result->SetStringField(TEXT("error"), TEXT("Asset not found"));
-		return Result;
-	}
-
-	// Basic asset info
-	Result->SetStringField(TEXT("name"), AssetData.AssetName.ToString());
-	Result->SetStringField(TEXT("path"), AssetData.GetObjectPathString());
-	Result->SetStringField(TEXT("class"), AssetData.AssetClassPath.ToString());
-	Result->SetStringField(TEXT("package"), AssetData.PackageName.ToString());
-
-	// Add Blueprint-specific details if it's a Blueprint
-	if (AssetData.AssetClassPath == UBlueprint::StaticClass()->GetClassPathName())
-	{
-		UBlueprint* Blueprint = Cast<UBlueprint>(AssetData.GetAsset());
-		if (Blueprint)
+		if (!Params.IsValid() || !Params->HasField(TEXT("asset_path")))
 		{
-			TSharedPtr<FJsonObject> BlueprintDetails = MakeShareable(new FJsonObject);
-			
-			// Parent class info
-			if (Blueprint->ParentClass)
-			{
-				BlueprintDetails->SetStringField(TEXT("parent_class"), Blueprint->ParentClass->GetName());
-			}
+			Result->SetStringField(TEXT("error"), TEXT("Missing asset_path parameter"));
+			return Result;
+		}
 
-			// Variables
-			TArray<TSharedPtr<FJsonValue>> Variables;
-			for (const FBPVariableDescription& Variable : Blueprint->NewVariables)
+		FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+
+		// Get Asset Registry - Safe to call from Game Thread
+		FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry");
+		IAssetRegistry& AssetRegistry = AssetRegistryModule.Get();
+
+		// Find asset
+		FAssetData AssetData = AssetRegistry.GetAssetByObjectPath(FSoftObjectPath(AssetPath));
+		if (!AssetData.IsValid())
+		{
+			Result->SetStringField(TEXT("error"), TEXT("Asset not found"));
+			return Result;
+		}
+
+		// Basic asset info
+		Result->SetStringField(TEXT("name"), AssetData.AssetName.ToString());
+		Result->SetStringField(TEXT("path"), AssetData.GetObjectPathString());
+		Result->SetStringField(TEXT("class"), AssetData.AssetClassPath.ToString());
+		Result->SetStringField(TEXT("package"), AssetData.PackageName.ToString());
+
+		// Add Blueprint-specific details if it's a Blueprint
+		if (AssetData.AssetClassPath == UBlueprint::StaticClass()->GetClassPathName())
+		{
+			UBlueprint* Blueprint = Cast<UBlueprint>(AssetData.GetAsset()); // Asset loading must be on Game Thread
+			if (Blueprint)
 			{
-				TSharedPtr<FJsonObject> VarJson = MakeShareable(new FJsonObject);
-				VarJson->SetStringField(TEXT("name"), Variable.VarName.ToString());
+				TSharedPtr<FJsonObject> BlueprintDetails = MakeShareable(new FJsonObject);
+				
+				// Parent class info
+				if (Blueprint->ParentClass)
+				{
+					BlueprintDetails->SetStringField(TEXT("parent_class"), Blueprint->ParentClass->GetName());
+				}
+
+				// Variables
+				TArray<TSharedPtr<FJsonValue>> Variables;
+				for (const FBPVariableDescription& Variable : Blueprint->NewVariables)
+				{
+					TSharedPtr<FJsonObject> VarJson = MakeShareable(new FJsonObject);
+					VarJson->SetStringField(TEXT("name"), Variable.VarName.ToString());
 				VarJson->SetStringField(TEXT("type"), Variable.VarType.PinCategory.ToString());
 				VarJson->SetBoolField(TEXT("is_public"), Variable.PropertyFlags & CPF_BlueprintVisible);
 				Variables.Add(MakeShareable(new FJsonValueObject(VarJson)));
@@ -608,76 +712,81 @@ TSharedPtr<FJsonObject> FMCPJsonRpcServer::HandleResourcesGet(TSharedPtr<FJsonOb
 			}
 			BlueprintDetails->SetArrayField(TEXT("functions"), Functions);
 
-			Result->SetObjectField(TEXT("blueprint_details"), BlueprintDetails);
+				Result->SetObjectField(TEXT("blueprint_details"), BlueprintDetails);
+			}
 		}
-	}
 
-	return Result;
+		return Result;
+	});
 }
 
 TSharedPtr<FJsonObject> FMCPJsonRpcServer::HandleResourcesCreate(TSharedPtr<FJsonObject> Params)
 {
-	TSharedPtr<FJsonObject> Result = MakeShareable(new FJsonObject);
-
-	if (!Params.IsValid())
+	// THREAD SAFETY FIX: Execute asset creation on Game Thread
+	return ExecuteOnGameThread<TSharedPtr<FJsonObject>>([this, Params]() -> TSharedPtr<FJsonObject>
 	{
-		Result->SetStringField(TEXT("error"), TEXT("Missing parameters"));
-		return Result;
-	}
+		TSharedPtr<FJsonObject> Result = MakeShareable(new FJsonObject);
 
-	// Get required parameters
-	FString AssetType, AssetName, Path;
-	if (!Params->TryGetStringField(TEXT("asset_type"), AssetType) ||
-		!Params->TryGetStringField(TEXT("asset_name"), AssetName) ||
-		!Params->TryGetStringField(TEXT("path"), Path))
-	{
-		Result->SetStringField(TEXT("error"), TEXT("Missing required parameters: asset_type, asset_name, path"));
-		return Result;
-	}
-
-	// Handle Blueprint creation
-	if (AssetType == TEXT("Blueprint"))
-	{
-		// Get Asset Tools
-		FAssetToolsModule& AssetToolsModule = FModuleManager::LoadModuleChecked<FAssetToolsModule>("AssetTools");
-		IAssetTools& AssetTools = AssetToolsModule.Get();
-
-		// Create Blueprint Factory
-		UBlueprintFactory* Factory = NewObject<UBlueprintFactory>();
-		Factory->ParentClass = AActor::StaticClass(); // Default to Actor
-
-		// Override parent class if specified
-		if (Params->HasField(TEXT("parent_class")))
+		if (!Params.IsValid())
 		{
-			FString ParentClassName = Params->GetStringField(TEXT("parent_class"));
-			UClass* ParentClass = FindObject<UClass>(nullptr, *ParentClassName);
-			if (ParentClass)
-			{
-				Factory->ParentClass = ParentClass;
-			}
+			Result->SetStringField(TEXT("error"), TEXT("Missing parameters"));
+			return Result;
 		}
 
-		// Create the asset
-		FString PackageName = Path + TEXT("/") + AssetName;
-		UObject* NewAsset = AssetTools.CreateAsset(AssetName, Path, UBlueprint::StaticClass(), Factory);
-
-		if (NewAsset)
+		// Get required parameters
+		FString AssetType, AssetName, Path;
+		if (!Params->TryGetStringField(TEXT("asset_type"), AssetType) ||
+			!Params->TryGetStringField(TEXT("asset_name"), AssetName) ||
+			!Params->TryGetStringField(TEXT("path"), Path))
 		{
-			Result->SetStringField(TEXT("status"), TEXT("success"));
-			Result->SetStringField(TEXT("asset_path"), NewAsset->GetPathName());
+			Result->SetStringField(TEXT("error"), TEXT("Missing required parameters: asset_type, asset_name, path"));
+			return Result;
+		}
+
+		// Handle Blueprint creation
+		if (AssetType == TEXT("Blueprint"))
+		{
+			// Get Asset Tools - Safe to call from Game Thread
+			FAssetToolsModule& AssetToolsModule = FModuleManager::LoadModuleChecked<FAssetToolsModule>("AssetTools");
+			IAssetTools& AssetTools = AssetToolsModule.Get();
+
+			// Create Blueprint Factory - Must be on Game Thread
+			UBlueprintFactory* Factory = NewObject<UBlueprintFactory>();
+			Factory->ParentClass = AActor::StaticClass(); // Default to Actor
+
+			// Override parent class if specified
+			if (Params->HasField(TEXT("parent_class")))
+			{
+				FString ParentClassName = Params->GetStringField(TEXT("parent_class"));
+				UClass* ParentClass = FindObject<UClass>(nullptr, *ParentClassName);
+				if (ParentClass)
+				{
+					Factory->ParentClass = ParentClass;
+				}
+			}
+
+			// Create the asset - Must be on Game Thread
+			FString PackageName = Path + TEXT("/") + AssetName;
+			UObject* NewAsset = AssetTools.CreateAsset(AssetName, Path, UBlueprint::StaticClass(), Factory);
+
+			if (NewAsset)
+			{
+				Result->SetStringField(TEXT("status"), TEXT("success"));
+				Result->SetStringField(TEXT("asset_path"), NewAsset->GetPathName());
 			Result->SetStringField(TEXT("asset_name"), AssetName);
+			}
+			else
+			{
+				Result->SetStringField(TEXT("error"), TEXT("Failed to create Blueprint asset"));
+			}
 		}
 		else
 		{
-			Result->SetStringField(TEXT("error"), TEXT("Failed to create Blueprint asset"));
+			Result->SetStringField(TEXT("error"), FString::Printf(TEXT("Asset type '%s' not supported yet"), *AssetType));
 		}
-	}
-	else
-	{
-		Result->SetStringField(TEXT("error"), FString::Printf(TEXT("Asset type '%s' not supported yet"), *AssetType));
-	}
 
-	return Result;
+		return Result;
+	});
 }
 
 TSharedPtr<FJsonObject> FMCPJsonRpcServer::HandleToolsCreateBlueprint(TSharedPtr<FJsonObject> Params)
