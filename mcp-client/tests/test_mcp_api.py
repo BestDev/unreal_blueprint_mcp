@@ -60,12 +60,20 @@ class MCPApiTester:
             )
             
             if response.status_code == 200:
-                return response.json()
+                try:
+                    return response.json()
+                except json.JSONDecodeError as e:
+                    return {
+                        "error": {
+                            "code": -2,
+                            "message": f"Invalid JSON response: {str(e)}"
+                        }
+                    }
             else:
                 return {
                     "error": {
                         "code": response.status_code,
-                        "message": f"HTTP Error: {response.status_code}"
+                        "message": f"HTTP Error: {response.status_code} - {response.text[:100]}"
                     }
                 }
                 
@@ -99,15 +107,34 @@ class MCPApiTester:
         
         response = self.make_request(method, params)
         
-        # Check if response has error
-        if "error" in response:
-            print(f"   ❌ FAILED: {response['error']['message']}")
+        # Ensure response is a dictionary
+        if not isinstance(response, dict):
+            error_msg = f"Invalid response type: {type(response)} - {str(response)}"
+            print(f"   ❌ FAILED: {error_msg}")
             self.test_results.append({
                 "method": method,
                 "params": params,
                 "description": description,
                 "success": False,
-                "error": response["error"]["message"]
+                "error": error_msg
+            })
+            return False
+        
+        # Check if response has error
+        if "error" in response:
+            error_message = "Unknown error"
+            if isinstance(response["error"], dict) and "message" in response["error"]:
+                error_message = response["error"]["message"]
+            elif isinstance(response["error"], str):
+                error_message = response["error"]
+            
+            print(f"   ❌ FAILED: {error_message}")
+            self.test_results.append({
+                "method": method,
+                "params": params,
+                "description": description,
+                "success": False,
+                "error": error_message
             })
             return False
         

@@ -30,6 +30,7 @@ public class UnrealBlueprintMCP : ModuleRules
 				"EditorWidgets",
 				"Slate",
 				"SlateCore",
+				"ApplicationCore",
 				"HTTP",
 				"Json",
 				// Essential Blueprint Graph modules for K2Node classes (UE 5.6 compatible)
@@ -37,7 +38,9 @@ public class UnrealBlueprintMCP : ModuleRules
 				"KismetCompiler",
 				// Core editor modules for Blueprint editing
 				"AssetTools",
-				"AssetRegistry"
+				"AssetRegistry",
+				// Settings module for UDeveloperSettings integration
+				"DeveloperSettings"
 			}
 		);
 			
@@ -55,7 +58,9 @@ public class UnrealBlueprintMCP : ModuleRules
 				// Additional UE 5.6 compatible modules for K2Node functionality
 				"Kismet",
 				"GraphEditor",
-				"KismetWidgets"
+				"KismetWidgets",
+				// Settings editor integration
+				"Settings"
 			}
 		);
 		

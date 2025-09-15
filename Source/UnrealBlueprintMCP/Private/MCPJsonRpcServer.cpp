@@ -1,4 +1,5 @@
 #include "MCPJsonRpcServer.h"
+#include "MCPServerSettings.h"
 #include "Engine/Engine.h"
 #include "Engine/World.h"
 #include "Engine/Blueprint.h"
@@ -29,6 +30,10 @@
 #include "Kismet/KismetSystemLibrary.h"
 #include "Framework/Notifications/NotificationManager.h"
 #include "Widgets/Notifications/SNotificationList.h"
+#include "HAL/PlatformApplicationMisc.h"
+
+// Static member initialization
+int32 FMCPJsonRpcServer::LastUsedPort = 8080;
 
 FMCPJsonRpcServer::FMCPJsonRpcServer()
 	: ServerSocket(nullptr)
@@ -36,7 +41,21 @@ FMCPJsonRpcServer::FMCPJsonRpcServer()
 	, ServerPort(8080)
 	, bIsRunning(false)
 	, bStopRequested(false)
+	, ServerStartTime(FDateTime::MinValue())
+	, AppliedMaxConnections(10)
+	, AppliedTimeoutSeconds(30)
+	, bAppliedEnableCORS(false)
+	, bAppliedEnableAuth(false)
 {
+	// Initialize fallback ports
+	FallbackPorts = {8080, 8081, 8082, 8083, 8084, 8090, 9000, 9001};
+	
+	// Apply initial settings from UMCPServerSettings
+	const UMCPServerSettings* Settings = UMCPServerSettings::Get();
+	if (Settings)
+	{
+		ApplySettings(Settings);
+	}
 }
 
 FMCPJsonRpcServer::~FMCPJsonRpcServer()
@@ -117,7 +136,9 @@ bool FMCPJsonRpcServer::StartServer(int32 Port)
 	}
 
 	bIsRunning = true;
-	LogMessage(FString::Printf(TEXT("Server started on port %d"), ServerPort));
+	ServerStartTime = FDateTime::Now();
+	LastUsedPort = ServerPort;
+	LogMessage(FString::Printf(TEXT("Server started on port %d at %s"), ServerPort, *ServerStartTime.ToString()));
 	return true;
 }
 
@@ -147,6 +168,8 @@ void FMCPJsonRpcServer::StopServer()
 	}
 
 	bIsRunning = false;
+	ServerStartTime = FDateTime::MinValue();
+	ConnectedClientCount.Reset();
 	LogMessage(TEXT("Server stopped"));
 }
 
@@ -203,6 +226,9 @@ void FMCPJsonRpcServer::HandleClientConnection(FSocket* ClientSocket)
 	{
 		return;
 	}
+
+	// Increment connected client count
+	ConnectedClientCount.Increment();
 
 	// Read HTTP request
 	TArray<uint8> ReceivedData;
@@ -263,6 +289,9 @@ void FMCPJsonRpcServer::HandleClientConnection(FSocket* ClientSocket)
 	// Close client socket
 	ClientSocket->Close();
 	ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM)->DestroySocket(ClientSocket);
+	
+	// Decrement connected client count
+	ConnectedClientCount.Decrement();
 }
 
 FString FMCPJsonRpcServer::ProcessHttpRequest(const FString& RequestData)
@@ -471,10 +500,40 @@ FString FMCPJsonRpcServer::CreateHttpResponse(const FString& Content, const FStr
 	FString Response = TEXT("HTTP/1.1 200 OK\r\n");
 	Response += FString::Printf(TEXT("Content-Type: %s\r\n"), *ContentType);
 	Response += FString::Printf(TEXT("Content-Length: %d\r\n"), Content.Len());
-	// SECURITY FIX: Removed dangerous CORS headers that allowed any origin access
-	// Only localhost connections are now permitted due to 127.0.0.1 binding
+	
+	// Apply CORS headers if enabled in settings
+	if (bAppliedEnableCORS)
+	{
+		const UMCPServerSettings* Settings = UMCPServerSettings::Get();
+		if (Settings && Settings->AllowedOrigins.Num() > 0)
+		{
+			// Use specific allowed origins
+			FString AllowedOriginsHeader = FString::Join(Settings->AllowedOrigins, TEXT(", "));
+			Response += FString::Printf(TEXT("Access-Control-Allow-Origin: %s\r\n"), *AllowedOriginsHeader);
+		}
+		else
+		{
+			// Allow all origins (less secure, but useful for development)
+			Response += TEXT("Access-Control-Allow-Origin: *\r\n");
+		}
+		Response += TEXT("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n");
+		Response += TEXT("Access-Control-Allow-Headers: Content-Type, Authorization\r\n");
+		Response += TEXT("Access-Control-Max-Age: 86400\r\n");
+	}
+	
+	// Apply custom headers from settings
+	for (const auto& Header : AppliedCustomHeaders)
+	{
+		Response += FString::Printf(TEXT("%s: %s\r\n"), *Header.Key, *Header.Value);
+	}
+	
+	// Security headers (always applied)
 	Response += TEXT("X-Content-Type-Options: nosniff\r\n"); // Security header to prevent MIME type sniffing
-	Response += TEXT("X-Frame-Options: DENY\r\n"); // Prevent iframe embedding
+	if (!bAppliedEnableCORS)
+	{
+		Response += TEXT("X-Frame-Options: DENY\r\n"); // Prevent iframe embedding (unless CORS is enabled)
+	}
+	
 	Response += TEXT("\r\n");
 	Response += Content;
 	return Response;
@@ -1581,4 +1640,114 @@ TSharedPtr<FJsonObject> FMCPJsonRpcServer::HandlePromptsGet(TSharedPtr<FJsonObje
 	}
 
 	return Result;
+}
+
+bool FMCPJsonRpcServer::StartServerWithFallback(int32 PreferredPort)
+{
+	// Try preferred port first
+	if (StartServer(PreferredPort))
+	{
+		return true;
+	}
+
+	LogMessage(FString::Printf(TEXT("Port %d is unavailable, trying fallback ports..."), PreferredPort));
+
+	// Try fallback ports
+	for (int32 Port : FallbackPorts)
+	{
+		if (Port != PreferredPort && IsPortAvailable(Port))
+		{
+			if (StartServer(Port))
+			{
+				LogMessage(FString::Printf(TEXT("Server started on fallback port %d"), Port));
+				return true;
+			}
+		}
+	}
+
+	LogMessage(TEXT("All fallback ports are unavailable"));
+	return false;
+}
+
+bool FMCPJsonRpcServer::IsPortAvailable(int32 Port)
+{
+	ISocketSubsystem* SocketSubsystem = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM);
+	if (!SocketSubsystem)
+	{
+		return false;
+	}
+
+	FSocket* TestSocket = SocketSubsystem->CreateSocket(NAME_Stream, TEXT("PortTest"), false);
+	if (!TestSocket)
+	{
+		return false;
+	}
+
+	TSharedRef<FInternetAddr> TestAddr = SocketSubsystem->CreateInternetAddr();
+	bool bIsValid = false;
+	TestAddr->SetIp(TEXT("127.0.0.1"), bIsValid);
+	if (!bIsValid)
+	{
+		TestSocket->Close();
+		SocketSubsystem->DestroySocket(TestSocket);
+		return false;
+	}
+	TestAddr->SetPort(Port);
+
+	bool bPortAvailable = TestSocket->Bind(*TestAddr);
+	
+	TestSocket->Close();
+	SocketSubsystem->DestroySocket(TestSocket);
+	
+	return bPortAvailable;
+}
+
+bool FMCPJsonRpcServer::RestartServer()
+{
+	int32 CurrentPort = ServerPort;
+	
+	if (IsRunning())
+	{
+		StopServer();
+		// Wait a moment for cleanup
+		FPlatformProcess::Sleep(0.5f);
+	}
+	
+	return StartServer(CurrentPort);
+}
+
+void FMCPJsonRpcServer::ApplySettings(const UMCPServerSettings* Settings)
+{
+	if (!Settings)
+	{
+		return;
+	}
+
+	// Cache applied settings
+	AppliedMaxConnections = Settings->MaxClientConnections;
+	AppliedTimeoutSeconds = Settings->ServerTimeoutSeconds;
+	bAppliedEnableCORS = Settings->bEnableCORS;
+	bAppliedEnableAuth = Settings->bEnableAuthentication;
+	AppliedAPIKey = Settings->APIKey;
+	AppliedCustomHeaders = Settings->CustomHeaders;
+
+	// Apply port if server is not running
+	if (!IsRunning())
+	{
+		ServerPort = Settings->ServerPort;
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("MCP Server: Applied settings - Port: %d, MaxConnections: %d, Timeout: %ds, CORS: %s, Auth: %s"),
+		Settings->ServerPort, AppliedMaxConnections, AppliedTimeoutSeconds,
+		bAppliedEnableCORS ? TEXT("Enabled") : TEXT("Disabled"),
+		bAppliedEnableAuth ? TEXT("Enabled") : TEXT("Disabled"));
+}
+
+FString FMCPJsonRpcServer::GetAppliedSettingsString() const
+{
+	return FString::Printf(TEXT("Applied Settings - Port: %d, Max Connections: %d, Timeout: %ds, CORS: %s, Auth: %s, Custom Headers: %d"),
+		ServerPort, AppliedMaxConnections, AppliedTimeoutSeconds,
+		bAppliedEnableCORS ? TEXT("Enabled") : TEXT("Disabled"),
+		bAppliedEnableAuth ? TEXT("Enabled") : TEXT("Disabled"),
+		AppliedCustomHeaders.Num());
 }
